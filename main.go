@@ -1118,7 +1118,7 @@ func main() {
 		convMsgIdx = i
 		convView.Highlight(fmt.Sprintf("m%d", i)).ScrollToHighlight()
 		statusBar.SetText(fmt.Sprintf(
-			"[gray]msg [white]%d/%d[-][gray] | [yellow]{ }[-][gray] prompt | [yellow]j k[-][gray] line | [yellow]^u ^d[-][gray] half | [yellow]g G[-][gray] ends | [yellow]q[-][gray] list[-]",
+			"[gray]msg [white]%d/%d[-][gray] | [yellow]{ }[-][gray] prompt | [yellow]PgUp/PgDn[-][gray] half | [yellow]Ctrl+Home/End[-][gray] ends | [yellow]j k[-][gray] line | [yellow]q[-][gray] list[-]",
 			i+1, convMsgCount))
 	}
 
@@ -1294,6 +1294,28 @@ func main() {
 			app.SetFocus(focusables[focusIdx])
 			updateBorders()
 			return nil
+		case tcell.KeyPgUp, tcell.KeyPgDn:
+			// Half a screen, the same distance Claude Code moves in its own
+			// conversation view.
+			if focusIdx == 1 && !searching {
+				n := pageLines(2)
+				if ev.Key() == tcell.KeyPgUp {
+					n = -n
+				}
+				scrollBy(n)
+				return nil
+			}
+		case tcell.KeyHome, tcell.KeyEnd:
+			// Modifiers are ignored on purpose so Ctrl+Home and Ctrl+End, the
+			// pair Claude Code documents, land here alongside the bare keys.
+			if focusIdx == 1 && !searching {
+				if ev.Key() == tcell.KeyHome {
+					convView.ScrollToBeginning()
+				} else {
+					convView.ScrollToEnd()
+				}
+				return nil
+			}
 		case tcell.KeyCtrlD, tcell.KeyCtrlU, tcell.KeyCtrlF, tcell.KeyCtrlB:
 			if focusIdx == 1 && !searching {
 				switch ev.Key() {
