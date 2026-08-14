@@ -610,10 +610,13 @@ func decodePath(enc string) string {
 	if enc == "" {
 		return ""
 	}
-	// Windows: encoded path starts with drive letter like "C-Users-..."
-	if len(enc) >= 2 && enc[1] == '-' && ((enc[0] >= 'A' && enc[0] <= 'Z') || (enc[0] >= 'a' && enc[0] <= 'z')) {
-		root := string(enc[0]) + ":"
-		rest := enc[2:]
+	// Windows: both the drive colon and the separator are encoded, so
+	// "C:\Users\bob" arrives as "C--Users-bob" — a three-character prefix,
+	// not two. Splitting on the first "--" keeps the remainder clean.
+	// ponytail: UNC shares ("--host-share-...") aren't handled. We can't tell
+	// where the host name ends without listing "\\", which isn't listable.
+	if drive, rest, ok := strings.Cut(enc, "--"); ok && len(drive) == 1 {
+		root := drive + ":"
 		if result := resolveEncoded(root+string(filepath.Separator), rest); result != "" {
 			return result
 		}
@@ -633,23 +636,75 @@ func resolveEncoded(base, remaining string) string {
 	parts := strings.Split(remaining, "-")
 	for segLen := len(parts); segLen >= 1; segLen-- {
 		segment := strings.Join(parts[:segLen], "-")
-		candidate := filepath.Join(base, segment)
-		info, err := os.Stat(candidate)
-		if err != nil || !info.IsDir() {
-			continue
-		}
 		rest := ""
 		if segLen < len(parts) {
 			rest = strings.Join(parts[segLen:], "-")
 		}
-		if rest == "" {
-			return candidate
-		}
-		if result := resolveEncoded(candidate, rest); result != "" {
-			return result
+		// A segment can match more than one real directory; keep trying until
+		// one of them resolves the whole remainder.
+		for _, candidate := range candidateDirs(base, segment) {
+			if rest == "" {
+				return candidate
+			}
+			if result := resolveEncoded(candidate, rest); result != "" {
+				return result
+			}
 		}
 	}
 	return ""
+}
+
+// candidateDirs lists the subdirectories of base that an encoded segment could
+// name: the literal spelling first, then any name that matches with '-'
+// standing in for a character that was encoded away.
+func candidateDirs(base, segment string) []string {
+	var out []string
+	exact := filepath.Join(base, segment)
+	if info, err := os.Stat(exact); err == nil && info.IsDir() {
+		out = append(out, exact)
+	}
+	for _, m := range matchSegment(base, segment) {
+		if m != exact {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// matchSegment finds the subdirectories of base whose names match the encoded
+// segment, treating '-' as a wildcard for any single character. Claude Code
+// encodes every non-alphanumeric character as '-', so by the time we see the
+// name a '.', '_', a space and an accented letter are all indistinguishable
+// from a literal dash: "alex-blanes" is really "alex.blanes", "JV-LarExtractor"
+// is "JV_LarExtractor" and "Documentaci-n" is "Documentación". Comparison is
+// per rune so multi-byte characters line up.
+func matchSegment(base, segment string) []string {
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	want := []rune(segment)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		got := []rune(e.Name())
+		if len(got) != len(want) {
+			continue
+		}
+		matches := true
+		for i := range want {
+			if want[i] != '-' && want[i] != got[i] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			out = append(out, filepath.Join(base, e.Name()))
+		}
+	}
+	return out
 }
 
 // ── Text helpers ────────────────────────────────────────────────────────────
