@@ -670,16 +670,44 @@ func winShell() string {
 	return "powershell"
 }
 
-// wtOpen opens a new tab (or a split pane) in the Windows Terminal window we're
-// already running in. The working directory comes from wt's own -d, not from
-// the command string, so nothing here needs shell quoting.
+// wtWindow names a place wt can put a tab. Windows Terminal has no way to list
+// the windows that exist, so there is nothing to enumerate and offer: an
+// unknown id just creates another window, which is the thing we're avoiding.
+// What it does guarantee is that a *named* window is reused when it exists and
+// created once when it doesn't, so a dedicated window is the reliable way to
+// stop scattering sessions across new windows.
+type wtWindow struct {
+	Label  string
+	Window string // wt -w value: "0" this window, "-1" new, or a window name
+	Split  bool
+}
+
+var wtWindows = []wtWindow{
+	{"New tab in this window", "0", false},
+	{"Split this window", "0", true},
+	{"Claude window (reused every time)", "claude", false},
+	{"A brand new window", "-1", false},
+}
+
+// wtOpen keeps the old behaviour: a tab or a split in the current window.
 func wtOpen(command, dir string, inTab bool) error {
-	verb := "sp"
-	if inTab {
-		verb = "nt"
+	return wtOpenIn(command, dir, wtWindow{Window: "0", Split: !inTab})
+}
+
+// wtOpenIn runs command in the requested Windows Terminal window. The working
+// directory comes from wt's own -d rather than the command string, so nothing
+// here needs shell quoting.
+func wtOpenIn(command, dir string, target wtWindow) error {
+	verb := "nt"
+	if target.Split {
+		verb = "sp"
+	}
+	window := target.Window
+	if window == "" {
+		window = "0"
 	}
 	// A -d value ending in '\' would escape the closing quote Go wraps it in.
-	args := []string{"-w", "0", verb, "-d", strings.TrimRight(dir, `\`)}
+	args := []string{"-w", window, verb, "-d", strings.TrimRight(dir, `\`)}
 	if command != "" {
 		args = append(args, winShell(), "-NoExit", "-Command", command)
 	}
@@ -949,12 +977,12 @@ func main() {
 
 	// ── Actions ──
 
-	openSession := func(idx int, inTab bool) {
-		if idx < 0 || idx >= len(filteredIdx) || filteredIdx[idx] < 0 {
-			return
-		}
-		s := sessions[filteredIdx[idx]]
+	// Assigned further down, once the focus helpers it restores exist.
+	var askWhere func(s *Session)
 
+	// launch opens the session. target is only meaningful under Windows
+	// Terminal; the other backends keep their own tab/split behaviour.
+	launch := func(s *Session, inTab bool, target *wtWindow) {
 		// Resuming a session that is already running in another terminal
 		// interleaves both sides into one transcript and loses work. Branch
 		// off it instead: same context, its own session id, nothing clobbered.
@@ -964,22 +992,42 @@ func main() {
 			cmd += " --fork-session"
 		}
 
-		err := openInTerminal(cmd, s.ProjectDir, inTab, app)
+		var err error
+		where := activeBackend.String()
+		if target != nil {
+			err = wtOpenIn(cmd, s.ProjectDir, *target)
+			where = target.Label
+		} else {
+			err = openInTerminal(cmd, s.ProjectDir, inTab, app)
+			if inTab {
+				where += " tab"
+			} else {
+				where += " split"
+			}
+		}
 		if err != nil {
 			statusBar.SetText(fmt.Sprintf("[red]Failed (%s): %v[-]", activeBackend, err))
 			return
 		}
-		mode := "tab"
-		if !inTab {
-			mode = "split"
-		}
 		if isLive {
-			statusBar.SetText(fmt.Sprintf("[yellow]%s is already open (pid %d) — opened a fork in %s %s[-]",
-				esc(s.ProjectName), live.PID, activeBackend, mode))
+			statusBar.SetText(fmt.Sprintf("[yellow]%s is already open (pid %d) — opened a fork: %s[-]",
+				esc(s.ProjectName), live.PID, where))
 		} else {
-			statusBar.SetText(fmt.Sprintf("[green]Opened %s in %s %s[-]", esc(s.ProjectName), activeBackend, mode))
+			statusBar.SetText(fmt.Sprintf("[green]Opened %s: %s[-]", esc(s.ProjectName), where))
 		}
 		go refreshLive()
+	}
+
+	openSession := func(idx int, inTab bool) {
+		if idx < 0 || idx >= len(filteredIdx) || filteredIdx[idx] < 0 {
+			return
+		}
+		s := sessions[filteredIdx[idx]]
+		if activeBackend == backendWindowsTerminal {
+			askWhere(s)
+			return
+		}
+		launch(s, inTab, nil)
 	}
 
 	// gotoMsg parks the preview on one message, so you can walk a session's
@@ -1058,6 +1106,27 @@ func main() {
 			sessionList.SetBorderColor(tcell.ColorDodgerBlue)
 			convView.SetBorderColor(tcell.ColorGreen)
 		}
+	}
+
+	askWhere = func(s *Session) {
+		labels := make([]string, 0, len(wtWindows)+1)
+		for _, w := range wtWindows {
+			labels = append(labels, w.Label)
+		}
+		labels = append(labels, "Cancel")
+
+		modal := tview.NewModal().
+			SetText(fmt.Sprintf("Open %s where?", s.ProjectName)).
+			AddButtons(labels).
+			SetDoneFunc(func(i int, _ string) {
+				app.SetRoot(mainLayout, true)
+				app.SetFocus(focusables[focusIdx])
+				updateBorders()
+				if i >= 0 && i < len(wtWindows) {
+					launch(s, true, &wtWindows[i])
+				}
+			})
+		app.SetRoot(modal, true)
 	}
 
 	showSearch := func() {
