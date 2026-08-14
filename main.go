@@ -196,14 +196,52 @@ func fmtSize(b int64) string {
 	}
 }
 
+// trunc shortens s to n characters for a single-line row, stopping at the first
+// line break.
 func trunc(s string, n int) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		s = s[:i]
 	}
-	if len(s) > n {
-		return s[:n-3] + "..."
+	return truncBlock(s, n)
+}
+
+// truncBlock shortens s to n characters but keeps its line breaks, for previews
+// that are allowed more than one line. It counts runes, so a cut never lands in
+// the middle of a multi-byte character and turns "máquina" into mojibake.
+func truncBlock(s string, n int) string {
+	if n < 1 {
+		return ""
 	}
-	return s
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n <= 3 {
+		return string(r[:n])
+	}
+	return string(r[:n-3]) + "..."
+}
+
+// previewBudget is how many characters the info panel spends on the first and
+// last message together.
+const previewBudget = 900
+
+// splitBudget divides a preview budget between two messages, handing the slack
+// from whichever one is short to the other instead of cutting both at the same
+// arbitrary length.
+func splitBudget(a, b, total int) (int, int) {
+	if a+b <= total {
+		return a, b
+	}
+	half := total / 2
+	switch {
+	case a <= half:
+		return a, total - a
+	case b <= half:
+		return total - b, b
+	default:
+		return half, total - half
+	}
 }
 
 // isMeaningfulMsg filters out slash commands, system meta messages, and noise.
@@ -735,6 +773,7 @@ func main() {
 
 	convView := tview.NewTextView().
 		SetDynamicColors(true).
+		SetRegions(true).
 		SetWordWrap(true).
 		SetScrollable(true)
 	convView.SetBorder(true).
@@ -771,6 +810,9 @@ func main() {
 
 	// ── Session display ──
 
+	// Where the conversation preview is parked, so j/k can walk it.
+	convMsgCount, convMsgIdx := 0, 0
+
 	showSessionInfo := func(idx int) {
 		if idx < 0 || idx >= len(sessions) {
 			return
@@ -793,11 +835,16 @@ func main() {
 		if s.CWD != "" {
 			fmt.Fprintf(&b, "[yellow]CWD:[-]         %s\n", esc(s.CWD))
 		}
-		if s.FirstUserMsg != "" {
-			fmt.Fprintf(&b, "\n[yellow]First msg:[-]\n  %s\n", esc(trunc(s.FirstUserMsg, 200)))
+		last := s.LastUserMsg
+		if last == s.FirstUserMsg {
+			last = ""
 		}
-		if s.LastUserMsg != "" && s.LastUserMsg != s.FirstUserMsg {
-			fmt.Fprintf(&b, "\n[yellow]Last msg:[-]\n  %s\n", esc(trunc(s.LastUserMsg, 200)))
+		firstN, lastN := splitBudget(len([]rune(s.FirstUserMsg)), len([]rune(last)), previewBudget)
+		if s.FirstUserMsg != "" {
+			fmt.Fprintf(&b, "\n[yellow]First msg:[-]\n  %s\n", esc(truncBlock(s.FirstUserMsg, firstN)))
+		}
+		if last != "" {
+			fmt.Fprintf(&b, "\n[yellow]Last msg:[-]\n  %s\n", esc(truncBlock(last, lastN)))
 		}
 		if summary, ok := summaryCache[s.ID]; ok {
 			fmt.Fprintf(&b, "\n[aqua]── AI Summary ──[-]\n%s\n", esc(summary))
@@ -807,19 +854,21 @@ func main() {
 		infoView.SetText(b.String())
 		infoView.ScrollToBeginning()
 
+		// Each message is its own region so j/k can jump between them instead
+		// of scrolling by line.
 		var conv strings.Builder
-		for _, msg := range s.Messages {
-			content := msg.Content
-			if len(content) > 500 {
-				content = content[:497] + "..."
-			}
+		for i, msg := range s.Messages {
+			content := truncBlock(msg.Content, 500)
+			who := "[cyan]<<< Assistant:[-]"
 			if msg.Type == "user" {
-				conv.WriteString(fmt.Sprintf("[green]>>> User:[-]\n%s\n\n", esc(content)))
-			} else {
-				conv.WriteString(fmt.Sprintf("[cyan]<<< Assistant:[-]\n%s\n\n", esc(content)))
+				who = "[green]>>> User:[-]"
 			}
+			fmt.Fprintf(&conv, "[\"m%d\"]%s\n%s\n\n[\"\"]", i, who, esc(content))
 		}
 		convView.SetText(conv.String())
+		convMsgCount = len(s.Messages)
+		convMsgIdx = 0
+		convView.Highlight()
 		convView.ScrollToBeginning()
 	}
 
@@ -931,6 +980,25 @@ func main() {
 			statusBar.SetText(fmt.Sprintf("[green]Opened %s in %s %s[-]", esc(s.ProjectName), activeBackend, mode))
 		}
 		go refreshLive()
+	}
+
+	// gotoMsg parks the preview on one message, so you can walk a session's
+	// shape before deciding whether to open it.
+	gotoMsg := func(i int) {
+		if convMsgCount == 0 {
+			return
+		}
+		if i < 0 {
+			i = 0
+		}
+		if i >= convMsgCount {
+			i = convMsgCount - 1
+		}
+		convMsgIdx = i
+		convView.Highlight(fmt.Sprintf("m%d", i)).ScrollToHighlight()
+		statusBar.SetText(fmt.Sprintf(
+			"[gray]message [white]%d/%d[-][gray] | [yellow]j/k[-][gray] next/prev | [yellow]g/G[-][gray] first/last | [yellow]Tab[-][gray] back to list[-]",
+			i+1, convMsgCount))
 	}
 
 	requestSummary := func() {
@@ -1081,6 +1149,24 @@ func main() {
 							populateList(currentFilter)
 						})
 					}()
+					return nil
+				}
+			} else if focusIdx == 1 {
+				switch ev.Rune() {
+				case 'j', 'n':
+					gotoMsg(convMsgIdx + 1)
+					return nil
+				case 'k', 'p':
+					gotoMsg(convMsgIdx - 1)
+					return nil
+				case 'g':
+					gotoMsg(0)
+					return nil
+				case 'G':
+					gotoMsg(convMsgCount - 1)
+					return nil
+				case 'q':
+					app.Stop()
 					return nil
 				}
 			}
