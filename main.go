@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -66,10 +67,31 @@ func decodePath(enc string) string {
 	if enc == "" {
 		return ""
 	}
+	if runtime.GOOS == "windows" {
+		return decodeWindowsPath(enc)
+	}
 	if result := resolveEncoded("/", enc[1:]); result != "" {
 		return result
 	}
 	return "/" + strings.ReplaceAll(enc[1:], "-", "/")
+}
+
+// On Windows there is no leading '/', and the drive colon is encoded too:
+// "C:\Users\bob" becomes "C--Users-bob". Split off the drive, then walk the
+// rest exactly as on Unix.
+// ponytail: UNC shares ("--host-share-...") aren't handled. We can't tell
+// where the host name ends without listing "\\", which isn't listable. Add a
+// server-name hint in config if network projects ever matter.
+func decodeWindowsPath(enc string) string {
+	drive, rest, ok := strings.Cut(enc, "--")
+	if !ok || len(drive) != 1 {
+		return enc
+	}
+	base := drive + `:\`
+	if result := resolveEncoded(base, rest); result != "" {
+		return result
+	}
+	return base + strings.ReplaceAll(rest, "-", `\`)
 }
 
 func resolveEncoded(base, remaining string) string {
@@ -79,30 +101,84 @@ func resolveEncoded(base, remaining string) string {
 	parts := strings.Split(remaining, "-")
 	for segLen := len(parts); segLen >= 1; segLen-- {
 		segment := strings.Join(parts[:segLen], "-")
-		candidate := filepath.Join(base, segment)
-		info, err := os.Stat(candidate)
-		if err != nil || !info.IsDir() {
-			continue
-		}
 		rest := ""
 		if segLen < len(parts) {
 			rest = strings.Join(parts[segLen:], "-")
 		}
-		if rest == "" {
-			return candidate
-		}
-		if result := resolveEncoded(candidate, rest); result != "" {
-			return result
+		// A segment can match more than one real directory; keep trying until
+		// one of them resolves the whole remainder.
+		for _, candidate := range candidateDirs(base, segment) {
+			if rest == "" {
+				return candidate
+			}
+			if result := resolveEncoded(candidate, rest); result != "" {
+				return result
+			}
 		}
 	}
 	return ""
 }
 
+// candidateDirs lists the subdirectories of base that an encoded segment could
+// name: the literal spelling first, then any name that matches with '-'
+// standing in for a character that was encoded away.
+func candidateDirs(base, segment string) []string {
+	var out []string
+	exact := filepath.Join(base, segment)
+	if info, err := os.Stat(exact); err == nil && info.IsDir() {
+		out = append(out, exact)
+	}
+	for _, m := range matchSegment(base, segment) {
+		if m != exact {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// matchSegment finds the subdirectories of base whose names match the encoded
+// segment, treating '-' as a wildcard for any single character. Claude Code
+// encodes every non-alphanumeric character as '-', so by the time we see the
+// name a '.', a space and an accented letter are all indistinguishable from a
+// literal dash: "alex-blanes" is really "alex.blanes", and "Documentaci-n" is
+// "Documentación". Comparison is per rune so multi-byte characters line up.
+func matchSegment(base, segment string) []string {
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	want := []rune(segment)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		got := []rune(e.Name())
+		if len(got) != len(want) {
+			continue
+		}
+		matches := true
+		for i := range want {
+			if want[i] != '-' && want[i] != got[i] {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			out = append(out, filepath.Join(base, e.Name()))
+		}
+	}
+	return out
+}
+
 // ── Text helpers ────────────────────────────────────────────────────────────
 
 func lastSegment(p string) string {
-	parts := strings.Split(p, "/")
-	return parts[len(parts)-1]
+	p = strings.TrimRight(p, `/\`)
+	if i := strings.LastIndexAny(p, `/\`); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 // esc escapes '[' so tview doesn't interpret them as color tags.
@@ -259,6 +335,15 @@ func loadSession(path string) *Session {
 		}
 	}
 
+	// The transcript records the working directory verbatim, so prefer it over
+	// the name we reconstructed from the encoded project folder. Decoding is a
+	// guess -- every non-alphanumeric character arrives as '-' -- while this is
+	// the path Claude Code actually ran in.
+	if sess.CWD != "" {
+		sess.ProjectDir = sess.CWD
+		sess.ProjectName = lastSegment(sess.CWD)
+	}
+
 	// Filter out empty sessions and one-shot -p sessions (likely AI summary calls)
 	if sess.MessageCount == 0 || (sess.UserMsgCount <= 1 && sess.AsstMsgCount <= 1) {
 		return nil
@@ -305,11 +390,13 @@ const (
 	backendTmux
 	backendKitty
 	backendWezTerm
+	backendWindowsTerminal
+	backendWinConsole
 	backendFallback
 )
 
 func (b termBackend) String() string {
-	names := [...]string{"iTerm2", "Terminal.app", "tmux", "Kitty", "WezTerm", "fallback"}
+	names := [...]string{"iTerm2", "Terminal.app", "tmux", "Kitty", "WezTerm", "Windows Terminal", "Console", "fallback"}
 	if int(b) < len(names) {
 		return names[b]
 	}
@@ -319,6 +406,14 @@ func (b termBackend) String() string {
 var activeBackend termBackend
 
 func detectBackend() termBackend {
+	// Windows first: none of the Unix backends can launch anything here, and
+	// the generic fallback shells out to sh, which usually isn't on PATH.
+	if runtime.GOOS == "windows" {
+		if os.Getenv("WT_SESSION") != "" {
+			return backendWindowsTerminal
+		}
+		return backendWinConsole
+	}
 	if os.Getenv("TMUX") != "" {
 		return backendTmux
 	}
@@ -364,6 +459,10 @@ func openInTerminal(command, dir string, inTab bool, app *tview.Application) err
 		return kittyOpen(command, dir, inTab)
 	case backendWezTerm:
 		return weztermOpen(command, dir, inTab)
+	case backendWindowsTerminal:
+		return wtOpen(command, dir, inTab)
+	case backendWinConsole:
+		return winConsoleOpen(command, dir)
 	default:
 		var runErr error
 		app.Suspend(func() {
@@ -451,6 +550,56 @@ func weztermOpen(command, dir string, inTab bool) error {
 		return exec.Command("wezterm", "cli", "spawn", "--cwd", dir, "--", shell, "-c", fullCmd).Run()
 	}
 	return exec.Command("wezterm", "cli", "split-pane", "--right", "--cwd", dir, "--", shell, "-c", fullCmd).Run()
+}
+
+// interactiveShell is the command that opens a plain shell in a new tab.
+// On Windows it's empty on purpose: wt and cmd open their default profile,
+// which is what the user configured.
+func interactiveShell() string {
+	if runtime.GOOS == "windows" {
+		return ""
+	}
+	if sh := os.Getenv("SHELL"); sh != "" {
+		return sh
+	}
+	return "/bin/sh"
+}
+
+// winShell prefers PowerShell 7, falling back to the built-in Windows PowerShell.
+func winShell() string {
+	if _, err := exec.LookPath("pwsh"); err == nil {
+		return "pwsh"
+	}
+	return "powershell"
+}
+
+// wtOpen opens a new tab (or a split pane) in the Windows Terminal window we're
+// already running in. The working directory comes from wt's own -d, not from
+// the command string, so nothing here needs shell quoting.
+func wtOpen(command, dir string, inTab bool) error {
+	verb := "sp"
+	if inTab {
+		verb = "nt"
+	}
+	// A -d value ending in '\' would escape the closing quote Go wraps it in.
+	args := []string{"-w", "0", verb, "-d", strings.TrimRight(dir, `\`)}
+	if command != "" {
+		args = append(args, winShell(), "-NoExit", "-Command", command)
+	}
+	return exec.Command("wt.exe", args...).Run()
+}
+
+// winConsoleOpen opens a separate console window when Windows Terminal isn't
+// hosting us. A bare console has no tabs, so inTab has no meaning here.
+// `start` is a cmd builtin; its first quoted argument is the window title.
+func winConsoleOpen(command, dir string) error {
+	args := []string{"/c", "start", "", winShell()}
+	if command != "" {
+		args = append(args, "-NoExit", "-Command", command)
+	}
+	cmd := exec.Command("cmd", args...)
+	cmd.Dir = dir
+	return cmd.Run()
 }
 
 // ── AI Summary ──────────────────────────────────────────────────────────────
@@ -822,11 +971,7 @@ func main() {
 					return nil
 				case 'n': // New tab
 					home, _ := os.UserHomeDir()
-					shell := os.Getenv("SHELL")
-					if shell == "" {
-						shell = "/bin/sh"
-					}
-					err := openInTerminal(shell, home, true, app)
+					err := openInTerminal(interactiveShell(), home, true, app)
 					if err != nil {
 						statusBar.SetText(fmt.Sprintf("[red]Failed (%s): %v[-]", activeBackend, err))
 					} else {
