@@ -831,6 +831,11 @@ func generateSummary(s *Session) (string, error) {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
+	// The tab title is the only thing that tells this window from the ones it
+	// opens. CSI 22;2t stacks the terminal's own title so 23;2t restores it.
+	fmt.Print("\033[22;2t\033]2;csm - Claude sessions\007")
+	defer fmt.Print("\033[23;2t")
+
 	fmt.Print("Loading sessions...")
 	sessions := discoverSessions()
 	fmt.Print("\r\033[2K")
