@@ -222,9 +222,37 @@ func truncBlock(s string, n int) string {
 	return string(r[:n-3]) + "..."
 }
 
-// previewBudget is how many characters the info panel spends on the first and
-// last message together.
-const previewBudget = 900
+// previewBudget is how many characters the info panel spends on the first
+// message and the recent ones together.
+const previewBudget = 1200
+
+// maxRecentMsgs caps how many recent messages the panel will list, however
+// short they are, so the first message never scrolls out of sight.
+const maxRecentMsgs = 8
+
+// recentUserMsgs returns the most recent user messages that fit in budget,
+// oldest first. A single long message still takes the whole budget; several
+// short ones show up together, because a run of one-liners tells you far more
+// about where a session got to than the last of them on its own.
+func recentUserMsgs(s *Session, budget int) []string {
+	var out []string
+	for i := len(s.Messages) - 1; i >= 0 && budget > 0 && len(out) < maxRecentMsgs; i-- {
+		if s.Messages[i].Type != "user" {
+			continue
+		}
+		text := strings.TrimSpace(s.Messages[i].Content)
+		if !isMeaningfulMsg(text) {
+			continue
+		}
+		text = truncBlock(text, budget)
+		budget -= len([]rune(text))
+		out = append(out, text)
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
 
 // splitBudget divides a preview budget between two messages, handing the slack
 // from whichever one is short to the other instead of cutting both at the same
@@ -258,6 +286,29 @@ func isMeaningfulMsg(s string) bool {
 	}
 	if strings.HasPrefix(first, "Caveat:") {
 		return false
+	}
+	// Claude Code injects its own turns as user messages: hook output, task
+	// notifications, reminders, the echo of a slash command. They are not
+	// something the person typed, so they don't belong in a preview of what
+	// the session was about.
+	for _, tag := range []string{
+		"<task-notification>", "<system-reminder>", "<command-name>",
+		"<command-message>", "<local-command-stdout>", "<user-prompt-submit-hook>",
+		"[Request interrupted", "API Error", "<bash-input>", "<bash-stdout>",
+	} {
+		if strings.HasPrefix(first, tag) {
+			return false
+		}
+	}
+	// Compaction leaves its own two markers behind, one of them wrapped in
+	// ANSI dim codes, so match anywhere in the line rather than at the start.
+	for _, marker := range []string{
+		"This session is being continued from a previous conversation",
+		"Compacted (ctrl+o",
+	} {
+		if strings.Contains(first, marker) {
+			return false
+		}
 	}
 	if strings.HasPrefix(first, "/") {
 		word := strings.Fields(first)[0]
@@ -506,7 +557,13 @@ func detectBackend() termBackend {
 	// Windows first: none of the Unix backends can launch anything here, and
 	// the generic fallback shells out to sh, which usually isn't on PATH.
 	if runtime.GOOS == "windows" {
-		if os.Getenv("WT_SESSION") != "" {
+		// Detect Windows Terminal by wt being installed, not by WT_SESSION.
+		// That variable is only inherited by a shell running inside Terminal,
+		// so it is empty when csm is launched from Explorer or a bare console
+		// -- and `wt -w 0` still puts the tab in the most recently used
+		// Terminal window from there. Gating on the variable silently
+		// downgraded those launches to a detached console window.
+		if _, err := exec.LookPath("wt.exe"); err == nil {
 			return backendWindowsTerminal
 		}
 		return backendWinConsole
@@ -682,9 +739,11 @@ type wtWindow struct {
 	Split  bool
 }
 
+// "0" is the most recently used Terminal window, which is the one you were
+// last looking at whether or not csm itself is running inside it.
 var wtWindows = []wtWindow{
-	{"New tab in this window", "0", false},
-	{"Split this window", "0", true},
+	{"New tab in the last window used", "0", false},
+	{"Split the last window used", "0", true},
 	{"Claude window (reused every time)", "claude", false},
 	{"A brand new window", "-1", false},
 }
@@ -838,8 +897,10 @@ func main() {
 
 	// ── Session display ──
 
-	// Where the conversation preview is parked, so j/k can walk it.
+	// Where the conversation preview is parked, and which of its messages are
+	// prompts, so { and } can walk between them.
 	convMsgCount, convMsgIdx := 0, 0
+	var convPrompts []int
 
 	showSessionInfo := func(idx int) {
 		if idx < 0 || idx >= len(sessions) {
@@ -863,16 +924,26 @@ func main() {
 		if s.CWD != "" {
 			fmt.Fprintf(&b, "[yellow]CWD:[-]         %s\n", esc(s.CWD))
 		}
-		last := s.LastUserMsg
-		if last == s.FirstUserMsg {
-			last = ""
+		// Measure the tail at full budget first, so a short one hands its slack
+		// to the opening message rather than the other way round.
+		tailLen := 0
+		for _, m := range recentUserMsgs(s, previewBudget) {
+			tailLen += len([]rune(m))
 		}
-		firstN, lastN := splitBudget(len([]rune(s.FirstUserMsg)), len([]rune(last)), previewBudget)
+		firstN, tailN := splitBudget(len([]rune(s.FirstUserMsg)), tailLen, previewBudget)
+
 		if s.FirstUserMsg != "" {
 			fmt.Fprintf(&b, "\n[yellow]First msg:[-]\n  %s\n", esc(truncBlock(s.FirstUserMsg, firstN)))
 		}
-		if last != "" {
-			fmt.Fprintf(&b, "\n[yellow]Last msg:[-]\n  %s\n", esc(truncBlock(last, lastN)))
+		if tail := recentUserMsgs(s, tailN); len(tail) > 0 {
+			label := "Last msg"
+			if len(tail) > 1 {
+				label = fmt.Sprintf("Last %d msgs", len(tail))
+			}
+			fmt.Fprintf(&b, "\n[yellow]%s:[-]\n", label)
+			for _, m := range tail {
+				fmt.Fprintf(&b, "  [#888888]·[-] %s\n", esc(m))
+			}
 		}
 		if summary, ok := summaryCache[s.ID]; ok {
 			fmt.Fprintf(&b, "\n[aqua]── AI Summary ──[-]\n%s\n", esc(summary))
@@ -885,11 +956,13 @@ func main() {
 		// Each message is its own region so j/k can jump between them instead
 		// of scrolling by line.
 		var conv strings.Builder
+		convPrompts = convPrompts[:0]
 		for i, msg := range s.Messages {
 			content := truncBlock(msg.Content, 500)
 			who := "[cyan]<<< Assistant:[-]"
 			if msg.Type == "user" {
 				who = "[green]>>> User:[-]"
+				convPrompts = append(convPrompts, i)
 			}
 			fmt.Fprintf(&conv, "[\"m%d\"]%s\n%s\n\n[\"\"]", i, who, esc(content))
 		}
@@ -1045,8 +1118,52 @@ func main() {
 		convMsgIdx = i
 		convView.Highlight(fmt.Sprintf("m%d", i)).ScrollToHighlight()
 		statusBar.SetText(fmt.Sprintf(
-			"[gray]message [white]%d/%d[-][gray] | [yellow]j/k[-][gray] next/prev | [yellow]g/G[-][gray] first/last | [yellow]Tab[-][gray] back to list[-]",
+			"[gray]msg [white]%d/%d[-][gray] | [yellow]{ }[-][gray] prompt | [yellow]j k[-][gray] line | [yellow]^u ^d[-][gray] half | [yellow]g G[-][gray] ends | [yellow]q[-][gray] list[-]",
 			i+1, convMsgCount))
+	}
+
+	// gotoPrompt walks between prompts, the way { and } do in Claude Code's
+	// own transcript view. Landing on the last one when there is no next is
+	// deliberate: it doubles as "jump to the end".
+	gotoPrompt := func(dir int) {
+		if len(convPrompts) == 0 {
+			return
+		}
+		if dir > 0 {
+			for _, m := range convPrompts {
+				if m > convMsgIdx {
+					gotoMsg(m)
+					return
+				}
+			}
+			gotoMsg(convPrompts[len(convPrompts)-1])
+			return
+		}
+		for i := len(convPrompts) - 1; i >= 0; i-- {
+			if convPrompts[i] < convMsgIdx {
+				gotoMsg(convPrompts[i])
+				return
+			}
+		}
+		gotoMsg(convPrompts[0])
+	}
+
+	// pageLines is the viewport height divided by frac: 1 for a full page, 2
+	// for the half page ^u and ^d move.
+	pageLines := func(frac int) int {
+		_, _, _, h := convView.GetInnerRect()
+		if h < 2 {
+			h = 2
+		}
+		return h / frac
+	}
+
+	scrollBy := func(lines int) {
+		row, col := convView.GetScrollOffset()
+		if row+lines < 0 {
+			lines = -row
+		}
+		convView.ScrollTo(row+lines, col)
 	}
 
 	requestSummary := func() {
@@ -1177,6 +1294,20 @@ func main() {
 			app.SetFocus(focusables[focusIdx])
 			updateBorders()
 			return nil
+		case tcell.KeyCtrlD, tcell.KeyCtrlU, tcell.KeyCtrlF, tcell.KeyCtrlB:
+			if focusIdx == 1 && !searching {
+				switch ev.Key() {
+				case tcell.KeyCtrlD:
+					scrollBy(pageLines(2))
+				case tcell.KeyCtrlU:
+					scrollBy(-pageLines(2))
+				case tcell.KeyCtrlF:
+					scrollBy(pageLines(1))
+				case tcell.KeyCtrlB:
+					scrollBy(-pageLines(1))
+				}
+				return nil
+			}
 		case tcell.KeyEscape:
 			if searching {
 				hideSearch()
@@ -1221,21 +1352,38 @@ func main() {
 					return nil
 				}
 			} else if focusIdx == 1 {
+				// Same keys as Claude Code's transcript view, so there is
+				// nothing new to learn: { } between prompts, j k by line,
+				// space/b by page, g G to the ends.
 				switch ev.Rune() {
-				case 'j', 'n':
-					gotoMsg(convMsgIdx + 1)
+				case '}':
+					gotoPrompt(1)
 					return nil
-				case 'k', 'p':
-					gotoMsg(convMsgIdx - 1)
+				case '{':
+					gotoPrompt(-1)
 					return nil
 				case 'g':
-					gotoMsg(0)
+					convView.ScrollToBeginning()
 					return nil
 				case 'G':
-					gotoMsg(convMsgCount - 1)
+					convView.ScrollToEnd()
+					return nil
+				case 'j':
+					scrollBy(1)
+					return nil
+				case 'k':
+					scrollBy(-1)
+					return nil
+				case ' ':
+					scrollBy(pageLines(1))
+					return nil
+				case 'b':
+					scrollBy(-pageLines(1))
 					return nil
 				case 'q':
-					app.Stop()
+					focusIdx = 0
+					app.SetFocus(focusables[0])
+					updateBorders()
 					return nil
 				}
 			}
