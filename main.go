@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -268,6 +269,64 @@ func extractText(raw json.RawMessage) string {
 		return strings.Join(parts, "\n")
 	}
 	return ""
+}
+
+// ── Live sessions ───────────────────────────────────────────────────────────
+
+// liveSession is the part of `claude agents --json` we care about.
+type liveSession struct {
+	PID       int    `json:"pid"`
+	SessionID string `json:"sessionId"`
+	Status    string `json:"status"`
+	Name      string `json:"name"`
+}
+
+var (
+	liveMu   sync.RWMutex
+	liveByID = map[string]liveSession{}
+)
+
+// refreshLive asks Claude Code which sessions are running right now. Asking it
+// directly is exact where reading process command lines is not: a session
+// started without --resume carries no session id on its command line, and
+// wmic, the usual way to read them on Windows, was removed in Windows 11 24H2.
+// The call takes a couple of seconds, so it must never run on the UI goroutine.
+func refreshLive() {
+	out, err := exec.Command("claude", "agents", "--json").Output()
+	if err != nil {
+		return // keep the last snapshot; a failed call is not proof of idleness
+	}
+	var list []liveSession
+	if json.Unmarshal(out, &list) != nil {
+		return
+	}
+	m := make(map[string]liveSession, len(list))
+	for _, s := range list {
+		m[s.SessionID] = s
+	}
+	liveMu.Lock()
+	liveByID = m
+	liveMu.Unlock()
+}
+
+func liveFor(id string) (liveSession, bool) {
+	liveMu.RLock()
+	defer liveMu.RUnlock()
+	s, ok := liveByID[id]
+	return s, ok
+}
+
+// liveMarker flags a running session in the list, so you can see it is open
+// somewhere else before you touch it.
+func liveMarker(id string) string {
+	live, ok := liveFor(id)
+	if !ok {
+		return "  "
+	}
+	if live.Status == "busy" {
+		return "[#ff8800]●[-] "
+	}
+	return "[#00c853]●[-] "
 }
 
 // ── Session loading ─────────────────────────────────────────────────────────
@@ -722,6 +781,9 @@ func main() {
 		fmt.Fprintf(&b, "[yellow]Project:[-]     %s\n", esc(s.ProjectName))
 		fmt.Fprintf(&b, "[yellow]Path:[-]        %s\n", esc(s.ProjectDir))
 		fmt.Fprintf(&b, "[yellow]Session:[-]     [green]%s[-]\n", s.ID)
+		if live, ok := liveFor(s.ID); ok {
+			fmt.Fprintf(&b, "[yellow]Running:[-]     [#ff8800]open in another terminal — pid %d, %s[-]\n", live.PID, live.Status)
+		}
 		fmt.Fprintf(&b, "[yellow]Modified:[-]    %s\n", s.ModTime.Format("2006-01-02 15:04:05"))
 		fmt.Fprintf(&b, "[yellow]Size:[-]        %s\n", fmtSize(s.FileSize))
 		fmt.Fprintf(&b, "[yellow]Messages:[-]    %d (%d user, %d asst)\n", s.MessageCount, s.UserMsgCount, s.AsstMsgCount)
@@ -767,7 +829,7 @@ func main() {
 
 	defaultStatus := func() string {
 		return fmt.Sprintf(
-			"[green]%d sessions[-] [gray](%s)[-] | [yellow]Enter[-] resume | [yellow]n[-] new | [yellow]s[-] split | [yellow]i[-] summary | [yellow]/[-] search | [yellow]r[-] refresh | [yellow]q[-] quit",
+			"[green]%d sessions[-] [gray](%s)[-] | [#00c853]●[-] open elsewhere (Enter branches) | [yellow]Enter[-] resume | [yellow]n[-] new | [yellow]s[-] split | [yellow]i[-] summary | [yellow]/[-] search | [yellow]r[-] refresh | [yellow]q[-] quit",
 			len(sessions), activeBackend,
 		)
 	}
@@ -795,7 +857,7 @@ func main() {
 		addItems := func(items []int, color string) {
 			for _, si := range items {
 				s := sessions[si]
-				label := fmt.Sprintf("%s(%s) %s[-]", color, s.ModTime.Format("01/02 15:04"), esc(s.ProjectName))
+				label := fmt.Sprintf("%s%s(%s) %s[-]", liveMarker(s.ID), color, s.ModTime.Format("01/02 15:04"), esc(s.ProjectName))
 				desc := esc(trunc(s.FirstUserMsg, 60))
 				if desc == "" {
 					desc = fmt.Sprintf("%d messages", s.MessageCount)
@@ -843,16 +905,32 @@ func main() {
 			return
 		}
 		s := sessions[filteredIdx[idx]]
-		err := openInTerminal(fmt.Sprintf("claude --resume %s", s.ID), s.ProjectDir, inTab, app)
+
+		// Resuming a session that is already running in another terminal
+		// interleaves both sides into one transcript and loses work. Branch
+		// off it instead: same context, its own session id, nothing clobbered.
+		cmd := fmt.Sprintf("claude --resume %s", s.ID)
+		live, isLive := liveFor(s.ID)
+		if isLive {
+			cmd += " --fork-session"
+		}
+
+		err := openInTerminal(cmd, s.ProjectDir, inTab, app)
 		if err != nil {
 			statusBar.SetText(fmt.Sprintf("[red]Failed (%s): %v[-]", activeBackend, err))
+			return
+		}
+		mode := "tab"
+		if !inTab {
+			mode = "split"
+		}
+		if isLive {
+			statusBar.SetText(fmt.Sprintf("[yellow]%s is already open (pid %d) — opened a fork in %s %s[-]",
+				esc(s.ProjectName), live.PID, activeBackend, mode))
 		} else {
-			mode := "tab"
-			if !inTab {
-				mode = "split"
-			}
 			statusBar.SetText(fmt.Sprintf("[green]Opened %s in %s %s[-]", esc(s.ProjectName), activeBackend, mode))
 		}
+		go refreshLive()
 	}
 
 	requestSummary := func() {
@@ -896,6 +974,13 @@ func main() {
 	focusIdx := 0
 	searching := false
 	currentFilter := ""
+
+	// Which sessions are live takes a couple of seconds to find out, so fetch
+	// it off the UI goroutine and redraw once it lands. Press r to refresh it.
+	go func() {
+		refreshLive()
+		app.QueueUpdateDraw(func() { populateList(currentFilter) })
+	}()
 
 	updateBorders := func() {
 		if focusIdx == 0 {
@@ -990,6 +1075,7 @@ func main() {
 							statusBar.SetText("[yellow]Refreshing...[-]")
 						})
 						fresh := discoverSessions()
+						refreshLive()
 						app.QueueUpdateDraw(func() {
 							sessions = fresh
 							populateList(currentFilter)
