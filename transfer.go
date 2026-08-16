@@ -110,13 +110,51 @@ func readLines(path string) ([]string, error) {
 	return out, nil
 }
 
+// hashLines identifies a transcript by its content with the working directory
+// blanked out. Import rewrites that field, so the same session on two machines
+// differs there by design — hashing it raw would report every round trip as a
+// divergence.
 func hashLines(lines []string) string {
 	h := sha256.New()
 	for _, l := range lines {
-		h.Write([]byte(l))
+		h.Write([]byte(blankCWD(l)))
 		h.Write([]byte{'\n'})
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// blankCWD replaces every recorded cwd value with a placeholder.
+//
+// ponytail: the value ends at the next quote. JSON escapes a quote as \", and
+// Windows forbids one in a path, so scanning for the next " is right here and
+// only wrong for a POSIX path containing a literal quote.
+func blankCWD(line string) string {
+	var b strings.Builder
+	rest := line
+	for {
+		i := strings.Index(rest, `"cwd":`)
+		if i < 0 {
+			break
+		}
+		v := i + len(`"cwd":`)
+		for v < len(rest) && rest[v] == ' ' {
+			v++
+		}
+		if v >= len(rest) || rest[v] != '"' {
+			b.WriteString(rest[:v])
+			rest = rest[v:]
+			continue
+		}
+		end := strings.IndexByte(rest[v+1:], '"')
+		if end < 0 {
+			break
+		}
+		b.WriteString(rest[:i])
+		b.WriteString(`"cwd":""`)
+		rest = rest[v+1+end+1:]
+	}
+	b.WriteString(rest)
+	return b.String()
 }
 
 // cwdOf pulls the working directory out of the transcript. Claude Code records
@@ -137,14 +175,28 @@ func cwdOf(lines []string) string {
 // A textual replacement of the JSON-encoded value keeps every other byte of the
 // line intact — re-marshalling would reorder keys and rewrite escapes across a
 // multi-megabyte file for no reason.
+// A session does not always stay put: this one spent 63 of its 586 lines in a
+// subdirectory of the project. So the origin path is replaced as a prefix, and
+// only when what follows is the closing quote or a separator — otherwise
+// C:\a\b would also rewrite C:\a\bc.
 func retargetCWD(line, from, to string) string {
 	if from == to || from == "" {
 		return line
 	}
-	oldVal, _ := json.Marshal(from)
-	newVal, _ := json.Marshal(to)
-	line = strings.ReplaceAll(line, `"cwd":`+string(oldVal), `"cwd":`+string(newVal))
-	return strings.ReplaceAll(line, `"cwd": `+string(oldVal), `"cwd": `+string(newVal))
+	oldEsc, newEsc := jsonBody(from), jsonBody(to)
+	for _, key := range []string{`"cwd":"`, `"cwd": "`} {
+		for _, tail := range []string{`"`, `\\`} {
+			line = strings.ReplaceAll(line, key+oldEsc+tail, key+newEsc+tail)
+		}
+	}
+	return line
+}
+
+// jsonBody is a string encoded as JSON with the surrounding quotes removed, so
+// it can be matched as a prefix of a longer encoded value.
+func jsonBody(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b[1 : len(b)-1])
 }
 
 // ── Synced folders ───────────────────────────────────────────────────────────

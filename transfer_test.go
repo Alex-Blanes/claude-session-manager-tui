@@ -57,6 +57,54 @@ func TestRetargetCWDKeepsLineValid(t *testing.T) {
 	}
 }
 
+func TestRetargetCWDFollowsSubdirectories(t *testing.T) {
+	// The congress session spent 63 of its 586 lines in a subdirectory. Replacing
+	// only the exact path left those pointing at the machine it came from.
+	from := `C:\Users\alex.blanes\Nextcloud\Congreso PCE`
+	to := `C:\Users\alex-\Nextcloud\Congreso PCE`
+
+	sub := `{"cwd":"C:\\Users\\alex.blanes\\Nextcloud\\Congreso PCE\\herramientas"}`
+	got := retargetCWD(sub, from, to)
+	if !json.Valid([]byte(got)) {
+		t.Fatalf("not valid JSON: %s", got)
+	}
+	var m struct {
+		CWD string `json:"cwd"`
+	}
+	json.Unmarshal([]byte(got), &m)
+	if want := to + `\herramientas`; m.CWD != want {
+		t.Errorf("cwd = %q, want %q", m.CWD, want)
+	}
+
+	// A sibling that merely starts with the same text must be left alone.
+	sibling := `{"cwd":"C:\\Users\\alex.blanes\\Nextcloud\\Congreso PCE 2024"}`
+	if got := retargetCWD(sibling, from, to); got != sibling {
+		t.Errorf("rewrote a different directory that shares a prefix:\n %s", got)
+	}
+}
+
+func TestHashIgnoresTheWorkingDirectory(t *testing.T) {
+	// Import rewrites cwd, so a session that goes out and comes back must still
+	// hash the same or every round trip would look like a divergence.
+	here := []string{`{"cwd":"C:\\Users\\alex.blanes\\p","t":"hola"}`}
+	there := []string{`{"cwd":"C:\\Users\\alex-\\p","t":"hola"}`}
+	if hashLines(here) != hashLines(there) {
+		t.Error("the same conversation on two machines should hash alike")
+	}
+	if compareTranscripts(here, there) != ancestrySame {
+		t.Error("a round trip should read as the same session")
+	}
+	// Real differences must still show.
+	changed := []string{`{"cwd":"C:\\Users\\alex-\\p","t":"adios"}`}
+	if hashLines(here) == hashLines(changed) {
+		t.Error("a different conversation should hash differently")
+	}
+	// A line with no cwd survives untouched.
+	if got := blankCWD(`{"t":"x"}`); got != `{"t":"x"}` {
+		t.Errorf("blankCWD mangled a line without cwd: %s", got)
+	}
+}
+
 func TestCompareTranscriptsTellsAReturnFromADivergence(t *testing.T) {
 	base := []string{"a", "b", "c"}
 	grown := []string{"a", "b", "c", "d"}

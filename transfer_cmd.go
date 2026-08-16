@@ -324,8 +324,11 @@ func runImport(args []string) error {
 
 	switch state {
 	case ancestrySame:
-		fmt.Println("  already here and identical: nothing to do.")
-		return nil
+		if !*force {
+			fmt.Println("  already here and the same conversation: nothing to do (--force rewrites the paths anyway).")
+			return nil
+		}
+		fmt.Println("  already here and the same conversation: --force, rewriting its paths.")
 	case ancestryLocalNewer:
 		return fmt.Errorf("the copy here has %d lines and the package %d, with the same start: this machine is ahead, importing would lose work", len(mustLines(existing)), len(incoming))
 	case ancestryDiverged:
