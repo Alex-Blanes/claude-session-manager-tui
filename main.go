@@ -831,6 +831,27 @@ func generateSummary(s *Session) (string, error) {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
+	if len(os.Args) > 1 {
+		var err error
+		switch os.Args[1] {
+		case "export":
+			err = runExport(os.Args[2:])
+		case "import":
+			err = runImport(os.Args[2:])
+		case "-h", "--help", "help":
+			fmt.Println(usage)
+		default:
+			fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s\n", os.Args[1], usage)
+			os.Exit(2)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	purgeBackups()
+
 	// The tab title is the only thing that tells this window from the ones it
 	// opens. CSI 22;2t stacks the terminal's own title so 23;2t restores it.
 	fmt.Print("\033[22;2t\033]2;csm - Claude sessions\007")
