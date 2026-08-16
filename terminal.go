@@ -249,7 +249,7 @@ func (tw *TerminalWidget) Draw(screen tcell.Screen) {
 				screen.SetContent(x+col, y+row, ' ', nil, tcell.StyleDefault)
 			}
 		}
-		msg := "세션을 선택하면 여기서 실행됩니다"
+		msg := "Pick a session and it will run here"
 		runes := []rune(msg)
 		msgW := 0
 		for _, r := range runes {
